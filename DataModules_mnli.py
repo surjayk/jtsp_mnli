@@ -1,102 +1,110 @@
 # DataModules_mnli.py
 
-from datasets import load_dataset
+import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
+from datasets import load_dataset
 from Constants_mnli import hyperparameters
 
-class MNLIDataset(Dataset):
-    def __init__(self, hf_split, tokenizer=None, max_length=None):
+SEP_TOKEN = '[SEP]'
+CLS_TOKEN = '[CLS]'
+
+class MNLIJointDataset(Dataset):
+    def __init__(self, hf_split, main_tokenizer=None, policy_tokenizer=None, max_length=128, device="cpu"):
         self.hf_split = hf_split
-        self.tokenizer = tokenizer if tokenizer else AutoTokenizer.from_pretrained(hyperparameters["model_name"])
-        self.policy_tokenizer = AutoTokenizer.from_pretrained(hyperparameters["defer_model_name"])  # Deferral model tokenizer
-        self.max_length = max_length if max_length else hyperparameters["max_length"]
+        self.main_tokenizer = main_tokenizer if main_tokenizer is not None else AutoTokenizer.from_pretrained(hyperparameters["model_name"])
+        self.policy_tokenizer = policy_tokenizer if policy_tokenizer is not None else AutoTokenizer.from_pretrained(hyperparameters["defer_model_name"])
+        self.max_length = max_length
+        self.device = device
+        self.data = []
+        
+        for row in hf_split:
+            text1 = row["text1"]
+            text2 = row["text2"]
+            label = row["label"]
+            #skip examples with label -1 (unlabeled test split)
+            if label == -1:
+                continue
+            #create an embedding as the concatenation of text1 and text2 with CLS and SEP tokens
+            embedding = CLS_TOKEN + " " + text1 + " " + SEP_TOKEN + " " + text2
+            data_list = [embedding, embedding]
+            self.data.append({
+                "label": label,
+                "embedding": embedding,
+                "data_list": data_list,
+                "text1": text1,
+                "text2": text2,
+            })
+        self.tag2id = {0: 0, 1: 1, 2: 2}
 
     def __len__(self):
-        return len(self.hf_split)
+        return len(self.data)
 
-    def __getitem__(self, idx):
-        row = self.hf_split[idx]
-        text1 = row["text1"]
-        text2 = row["text2"]
-        label = row["label"]  # 0, 1, 2 or -1
+    def __getitem__(self, index):
+        item = self.data[index]
+        label = item["label"]
+        embedding = item["embedding"]
+        data_list = item["data_list"]
 
-        # Tokenization for the classifier
-        encodings = self.tokenizer(
-            text1,
-            text2,
+        input_ids = []
+        attention_masks = []
+        for line in data_list:
+            tokenized = self.main_tokenizer(
+                line,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_length
+            )
+            input_ids.append(tokenized["input_ids"])
+            attention_masks.append(tokenized["attention_mask"])
+        
+        tokenized_emb = self.policy_tokenizer(
+            embedding,
             padding="max_length",
             truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
+            max_length=self.max_length
         )
-        input_ids = encodings["input_ids"].squeeze(0)
-        attention_mask = encodings["attention_mask"].squeeze(0)
-
-        embedding_str = "[CLS] " + text1 + " [SEP] " + text2  
-
-        policy_enc = self.policy_tokenizer(
-            embedding_str,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        embedding_ids = policy_enc["input_ids"].squeeze(0)
-        embedding_mask = policy_enc["attention_mask"].squeeze(0)
+        emb_ids = tokenized_emb["input_ids"]
+        emb_attention_mask = tokenized_emb["attention_mask"]
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "embedding_ids": embedding_ids,     # For deferral policy
-            "embedding_mask": embedding_mask,   # For deferral policy
-            "label": label
+            "input_ids": torch.tensor(input_ids, dtype=torch.long, device=self.device),
+            "attention_mask": torch.tensor(attention_masks, dtype=torch.long, device=self.device),
+            "embedding": torch.tensor(emb_ids, dtype=torch.long, device=self.device),
+            "emb_attention_mask": torch.tensor(emb_attention_mask, dtype=torch.long, device=self.device),
+            "label": torch.tensor(label, dtype=torch.long, device=self.device),
         }
-
 
 def load_mnli_splits():
     dataset = load_dataset("SetFit/mnli")
-    # Official splits: train (393k), validation (9.8k), test (9.8k) with label=-1
-    train_split = dataset["train"]
-    val_split   = dataset["validation"]
-    test_split  = dataset["test"]
-    return train_split, val_split, test_split
+    full_train = dataset["train"]       # ~393k examples
+    val_split = dataset["validation"]     # ~9.8k examples
+    test_split = dataset["test"]          # ~9.8k examples, labels = -1
+    return full_train, val_split, test_split
 
+def create_dataloaders(device="cpu"):
+    full_train, val_raw, test_raw = load_mnli_splits()
 
-def create_dataloaders():
-    # Load raw splits from Hugging Face
-    hf_train, hf_val, hf_test = load_mnli_splits()
-
-    # Grab subset hyperparameters
     SUBSET_SIZE = hyperparameters["SUBSET_SIZE"]
-    TRAIN_SIZE  = hyperparameters["TRAIN_SIZE"]
-    TEST_SIZE   = hyperparameters["TEST_SIZE"]
-    VAL_SIZE    = hyperparameters["VAL_SIZE"]
+    TRAIN_SIZE = hyperparameters["TRAIN_SIZE"]
+    TEST_SIZE = hyperparameters["TEST_SIZE"]
+    VAL_SIZE = hyperparameters["VAL_SIZE"]
 
-    # Subset train split
-    if SUBSET_SIZE < len(hf_train):
-        hf_train = hf_train.select(range(SUBSET_SIZE))
+    small_train = full_train.select(range(SUBSET_SIZE))
+    train_subset = small_train.select(range(TRAIN_SIZE))
+    test_subset = small_train.select(range(TRAIN_SIZE, TRAIN_SIZE + TEST_SIZE))
+    val_subset = val_raw.select(range(VAL_SIZE))
 
-    # Split into train and internal test set
-    train_subset = hf_train.select(range(TRAIN_SIZE))
-    test_subset  = hf_train.select(range(TRAIN_SIZE, TRAIN_SIZE + TEST_SIZE))
+    main_tokenizer = AutoTokenizer.from_pretrained(hyperparameters["model_name"])
+    policy_tokenizer = AutoTokenizer.from_pretrained(hyperparameters["defer_model_name"])
 
-    # Select validation subset
-    val_subset = hf_val.select(range(VAL_SIZE)) if VAL_SIZE < len(hf_val) else hf_val
+    train_dataset = MNLIJointDataset(train_subset, main_tokenizer, policy_tokenizer, max_length=hyperparameters["max_length"], device=device)
+    val_dataset   = MNLIJointDataset(val_subset, main_tokenizer, policy_tokenizer, max_length=hyperparameters["max_length"], device=device)
+    test_dataset  = MNLIJointDataset(test_subset, main_tokenizer, policy_tokenizer, max_length=hyperparameters["max_length"], device=device)
 
-    # Tokenizer initialization
-    tokenizer = AutoTokenizer.from_pretrained(hyperparameters["model_name"])
+    train_loader = DataLoader(train_dataset, batch_size=hyperparameters["batch_size"], shuffle=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=hyperparameters["batch_size"], shuffle=False)
+    test_loader  = DataLoader(test_dataset,  batch_size=hyperparameters["batch_size"], shuffle=False)
 
-    # Build datasets
-    train_dataset = MNLIDataset(train_subset, tokenizer)
-    val_dataset   = MNLIDataset(val_subset, tokenizer)
-    test_dataset  = MNLIDataset(test_subset, tokenizer)
-
-    # Build dataloaders
-    batch_size = hyperparameters["batch_size"]
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    print(f"Train size: {len(train_dataset)}; Val size: {len(val_dataset)}; Test size: {len(test_dataset)}")
+    print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test size: {len(test_dataset)}")
     return train_loader, val_loader, test_loader

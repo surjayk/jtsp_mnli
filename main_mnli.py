@@ -3,304 +3,295 @@
 import argparse
 import wandb
 import random
+from tqdm.auto import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score, cohen_kappa_score
 from torch.optim import AdamW
-from tqdm.auto import tqdm
-from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score
+import os
 
-from transformers import get_linear_schedule_with_warmup
-
+from Constants_mnli import hyperparameters, config_dictionary
 from DataModules_mnli import create_dataloaders
 from SFRNModel_mnli import SFRNModel, DeferralClassifier
-from Constants_mnli import hyperparameters, config_dictionary
-
-def evaluate(model, policy, loader, device, criterion_cl, criterion_p):
-
-    model.eval()
-    policy.eval()
-
-    all_labels = []
-    all_preds = []
-    policy_labels = []
-    policy_preds = []
-
-    total_loss = 0.0
-    with torch.no_grad():
-        for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            embedding_ids = batch["embedding_ids"].to(device)
-            embedding_mask = batch["embedding_mask"].to(device)
-            labels = batch["label"].to(device)
-
-            logits, hidden = model(input_ids, attention_mask)
-            loss_cl = criterion_cl(logits, labels)
-
-            preds = torch.argmax(logits, dim=1)
-            defer_label = (preds != labels).long()
-
-            defer_logits = policy(embedding_ids, hidden, attention_mask=embedding_mask)
-            loss_defer = criterion_p(defer_logits, defer_label)
-
-            loss = loss_cl + loss_defer
-            total_loss += loss.item()
-
-            all_labels.extend(labels.cpu().tolist())
-            all_preds.extend(preds.cpu().tolist())
-            policy_labels.extend(defer_label.cpu().tolist())
-            policy_preds.extend(torch.argmax(defer_logits, dim=1).cpu().tolist())
-
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average="macro")
-    qwk = cohen_kappa_score(all_labels, all_preds, weights='quadratic')
-
-    policy_acc = accuracy_score(policy_labels, policy_preds)
-    policy_f1 = f1_score(policy_labels, policy_preds, average="macro")
-
-    return {
-        "loss": total_loss / len(loader),
-        "acc": acc,
-        "f1": f1,
-        "qwk": qwk,
-        "policy_acc": policy_acc,
-        "policy_f1": policy_f1
-    }
-
 
 def train(args):
-    wandb.init(project="mnli_experiment", config=config_dictionary)
+    wandb.init(project="mnli_joint_training", config=config_dictionary)
     random.seed(hyperparameters['random_seed'])
     np.random.seed(hyperparameters['random_seed'])
     torch.manual_seed(hyperparameters['random_seed'])
-
-    device = args.device if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    hyperparameters["p_lr"] = args.p_lr
-    hyperparameters["lr"] = args.clf_lr
-    hyperparameters["policy_hidden"] = args.policy_hidden
-    hyperparameters["alpha"] = args.alpha
-    hyperparameters["beta"] = args.beta
-    hyperparameters["train_id"] = args.run_name
-
-
-    train_loader, val_loader, test_loader = create_dataloaders()
-
-
-    model = SFRNModel(num_labels=hyperparameters['num_labels']).to(device)
-    policy = DeferralClassifier(
-        input_dim=hyperparameters['mlp_hidden'],  # model hidden size
-        hidden_dim=hyperparameters['policy_hidden'],
-        output_dim=2
-    ).to(device)
-
-    if hyperparameters["CL_CHECKPOINT_PATH"]:
-        model.load_state_dict(torch.load(hyperparameters["CL_CHECKPOINT_PATH"], map_location=device))
-        print(f"Loaded classifier checkpoint from {hyperparameters['CL_CHECKPOINT_PATH']}")
-
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(hyperparameters['random_seed'])
+    
+    DEVICE = args.device
+    print("Using device:", DEVICE)
+    print("Model name:", hyperparameters['model_name'])
+    print("Hyperparameters:", hyperparameters)
+    
+    train_loader, val_loader, test_loader = create_dataloaders(device=DEVICE)
+    
+    model = SFRNModel()
+    policy = DeferralClassifier()
+    model.to(DEVICE)
+    policy.to(DEVICE)
+    
+    #load pretrained SFRN weights (from pretraining checkpoint)
+    pretrained_ckpt = "/data/smk6961/jtsp/SFRN_mnli/checkpoint/checkpoint_sfrn_mnli_pretrain_best.pth"
+    if os.path.exists(pretrained_ckpt):
+        # Use strict=False to allow missing alpha and beta keys (which will be randomly initialized)
+        state_dict = torch.load(pretrained_ckpt, map_location=DEVICE)
+        model.load_state_dict(state_dict, strict=False)
+        print("Loaded pretrained SFRN model from", pretrained_ckpt)
+    else:
+        print("Pretrained checkpoint not found at", pretrained_ckpt)
+    
     optimizer = AdamW(model.parameters(), lr=hyperparameters['lr'], weight_decay=hyperparameters['weight_decay'])
     optimizer_p = AdamW(policy.parameters(), lr=hyperparameters['p_lr'], weight_decay=hyperparameters['weight_decay'])
-
-    criterion_cl = nn.CrossEntropyLoss()
-    criterion_p = nn.CrossEntropyLoss()
-
+    criterion = nn.CrossEntropyLoss()
+    weights = torch.tensor([0.01, 10.0]).to(DEVICE)
+    criterion_p = nn.CrossEntropyLoss(weight=weights)
+    
     num_training_steps = len(train_loader) * hyperparameters['epochs']
     warmup_steps = int(hyperparameters['WARMUP_STEPS'] * num_training_steps)
-
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps)
-    scheduler_p = get_linear_schedule_with_warmup(optimizer_p, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps)
-
-    pre_step = hyperparameters.get("pre_step", 1)     # classifier-only warm-up
-    mid_step = hyperparameters.get("mid_step", 2)     # policy-only warm-up
-    total_epochs = hyperparameters['epochs']
-
-    alpha = hyperparameters["alpha"]  # weight for classifier loss
-    beta  = hyperparameters["beta"]   # weight for policy loss
-
-    grad_accum_steps = hyperparameters.get("GRADIENT_ACCUMULATION_STEPS", 1)
-    best_acc, best_f1 = 0.0, 0.0
-    best_path = None
-
-    print(f"Phases => pre_step={pre_step}, mid_step={mid_step}, total_epochs={total_epochs}")
-
-    for epoch in range(total_epochs):
-        # Phase logic
-        if epoch < pre_step:
-            # classifier only
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps,
+                                                num_training_steps=num_training_steps)
+    scheduler_p = get_linear_schedule_with_warmup(optimizer_p, num_warmup_steps=warmup_steps,
+                                                num_training_steps=num_training_steps)
+    
+    grad_accum_steps = hyperparameters['GRADIENT_ACCUMULATION_STEPS']
+    
+    best_acc, best_f1 = 0, 0
+    best_ckp_path = ''
+    
+    # Training Loop
+    for epoch in range(hyperparameters['epochs']):
+        if epoch < hyperparameters['pre_step']:
             model.train()
             policy.eval()
-            phase_desc = "Classifier-Only"
-        elif epoch < mid_step:
-            # policy only
+        elif epoch < hyperparameters['mid_step']:
             model.eval()
             policy.train()
-            phase_desc = "Policy-Only"
         else:
-            # joint
             model.train()
             policy.train()
-            phase_desc = "Joint"
-
-        print(f"\n=== EPOCH {epoch+1}/{total_epochs} ({phase_desc} phase) ===")
-
-        train_loss, train_cl_loss, train_policy_loss = 0.0, 0.0, 0.0
+        
+        train_loss, train_policy_loss, train_cl_loss = 0.0, 0.0, 0.0
         y_true, y_pred = [], []
         p_true, p_pred = [], []
-
-        # Training loop
+        y_defer = []
+        
+        train_iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}/{hyperparameters['epochs']} - Train")
         optimizer.zero_grad()
         optimizer_p.zero_grad()
-
-        for step, batch in enumerate(tqdm(train_loader, desc="Training")):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            embedding_ids = batch["embedding_ids"].to(device)
-            embedding_mask = batch["embedding_mask"].to(device)
-            labels = batch["label"].to(device)
-
-            # Forward pass: Classifier
-            logits, hidden = model(input_ids, attention_mask)
-            loss_cl = criterion_cl(logits, labels)
-
-            # Determine deferral label
-            preds = torch.argmax(logits, dim=1)
-            defer_label = (preds != labels).long()
-
-            # Forward pass: Deferral policy
-            defer_logits = policy(embedding_ids, hidden, attention_mask=embedding_mask)
+        for step, batch in enumerate(train_iterator):
+            input_ids = batch["input_ids"].to(DEVICE)            # shape: (B, num_candidates, seq_len)
+            attention_mask = batch["attention_mask"].to(DEVICE)      # shape: (B, num_candidates, seq_len)
+            emb = batch["embedding"].to(DEVICE)                    # shape: (B, seq_len)
+            emb_attention_mask = batch["emb_attention_mask"].to(DEVICE)  # shape: (B, seq_len)
+            labels = batch["label"].to(DEVICE)                     # shape: (B)
+            
+            # Forward pass: model returns logits and intermediate features (hidden)
+            logits, hidden = model(input_ids, emb, attention_mask=attention_mask, emb_attention_mask=None)
+            # Get model predictions (vectorized over batch)
+            pred_idx = torch.argmax(logits, dim=1)  # shape: (B)
+            # Create deferral labels: 0 if prediction is correct, 1 if incorrect
+            defer_label = (pred_idx != labels).long()  # shape: (B)
+            
+            hidden_unsq = hidden.unsqueeze(1)  # shape: (B, 1, feature_dim)
+            defer_logits = policy(emb, hidden_unsq, emb_attention_mask)
+            p_pred_idx = torch.argmax(defer_logits, dim=1)  # shape: (B)
+            
+            loss_cl = criterion(logits, labels)
             loss_defer = criterion_p(defer_logits, defer_label)
-
-            # Which losses to use depending on phase
-            if epoch < pre_step:
-                # classifier only
+            loss_cl = loss_cl / grad_accum_steps
+            loss_defer = loss_defer / grad_accum_steps
+            
+            if epoch < hyperparameters['pre_step']:
                 loss = loss_cl
-            elif epoch < mid_step:
-                # policy only
+            elif epoch < hyperparameters['mid_step']:
                 loss = loss_defer
             else:
-                # joint
-                loss = alpha * loss_cl + beta * loss_defer
-
-            # Gradient accumulation
-            loss = loss / grad_accum_steps
+                loss = hyperparameters['alpha'] * loss_cl + hyperparameters['beta'] * loss_defer
+            
             loss.backward()
-
             train_loss += loss.item()
-            train_cl_loss += loss_cl.item() / grad_accum_steps
-            train_policy_loss += loss_defer.item() / grad_accum_steps
-
-            # Collect metrics
-            y_true.extend(labels.cpu().tolist())
-            y_pred.extend(preds.cpu().tolist())
-            p_true.extend(defer_label.cpu().tolist())
-            p_pred.extend(torch.argmax(defer_logits, dim=1).cpu().tolist())
-
+            train_cl_loss += loss_cl.item()
+            train_policy_loss += loss_defer.item()
+            
+            # Accumulate metrics over the batch
+            y_true.extend(labels.cpu().numpy().tolist())
+            y_pred.extend(pred_idx.cpu().numpy().tolist())
+            p_true.extend(defer_label.cpu().numpy().tolist())
+            p_pred.extend(p_pred_idx.cpu().numpy().tolist())
+            # For final prediction, if the deferral policy predicts 1 (defer), use the true label; otherwise, use model prediction
+            final_pred = torch.where(p_pred_idx == 1, labels, pred_idx)
+            y_defer.extend(final_pred.cpu().numpy().tolist())
+            
             if (step + 1) % grad_accum_steps == 0:
-                # Clip grad if needed
                 nn.utils.clip_grad_norm_(model.parameters(), hyperparameters['max_norm'])
                 nn.utils.clip_grad_norm_(policy.parameters(), hyperparameters['max_norm'])
-
-                if epoch < pre_step:
-                    # Update classifier only
+                if epoch < hyperparameters['pre_step']:
                     optimizer.step()
                     optimizer.zero_grad()
-                    # policy stays in eval mode, but we can zero its grad
                     optimizer_p.zero_grad()
                     scheduler.step()
-                elif epoch < mid_step:
-                    # Update policy only
+                elif epoch < hyperparameters['mid_step']:
                     optimizer_p.step()
-                    optimizer_p.zero_grad()
-                    # classifier stays in eval mode, but we can zero its grad
                     optimizer.zero_grad()
+                    optimizer_p.zero_grad()
                     scheduler_p.step()
                 else:
-                    # Joint update
                     optimizer.step()
-                    optimizer.zero_grad()
                     optimizer_p.step()
+                    optimizer.zero_grad()
                     optimizer_p.zero_grad()
                     scheduler.step()
                     scheduler_p.step()
-
-        train_acc = accuracy_score(y_true, y_pred)
-        train_f1  = f1_score(y_true, y_pred, average="macro")
+                    
+        train_f1 = f1_score(y_true, y_pred, average='macro')
         train_qwk = cohen_kappa_score(y_true, y_pred, weights='quadratic')
-
-        policy_acc = accuracy_score(p_true, p_pred)
-        policy_f1  = f1_score(p_true, p_pred, average="macro")
-
-        print(f"[Train] loss={train_loss:.4f} cl_loss={train_cl_loss:.4f} policy_loss={train_policy_loss:.4f} ")
-        print(f"        acc={train_acc:.3f}, f1={train_f1:.3f}, qwk={train_qwk:.3f}")
-        print(f"        policy_acc={policy_acc:.3f}, policy_f1={policy_f1:.3f}")
-
-        # Validation
-        val_metrics = evaluate(model, policy, val_loader, device, criterion_cl, criterion_p)
-        print(f"[Val]   loss={val_metrics['loss']:.4f}  acc={val_metrics['acc']:.3f}, f1={val_metrics['f1']:.3f}, qwk={val_metrics['qwk']:.3f}")
-        print(f"        policy_acc={val_metrics['policy_acc']:.3f}, policy_f1={val_metrics['policy_f1']:.3f}")
-
-        # Track best model by validation accuracy (or f1)
-        if val_metrics["acc"] > best_acc:
-            best_acc = val_metrics["acc"]
-            best_f1  = val_metrics["f1"]
-            best_path = f"checkpoint/{hyperparameters['train_id']}_best.pth"
-            torch.save(model.state_dict(), best_path)
-            print(f"[*] Best model updated => {best_path}")
-
-        # Log to W&B
+        train_acc = accuracy_score(y_true, y_pred)
+        train_policy_acc = accuracy_score(p_true, p_pred)
+        train_policy_f1 = f1_score(p_true, p_pred, average='macro')
+        print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}, Policy Acc: {train_policy_acc:.4f}")
+        
+        # Validation Loop
+        model.eval()
+        policy.eval()
+        val_loss, val_policy_loss, val_cl_loss = 0.0, 0.0, 0.0
+        val_y_true, val_y_pred = [], []
+        val_p_true, val_p_pred = [], []
+        val_y_defer = []
+        defer_count = 0
+        val_iterator = tqdm(val_loader, desc=f"Epoch {epoch+1}/{hyperparameters['epochs']} - Validation")
+        for step, batch in enumerate(val_iterator):
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            emb = batch["embedding"].to(DEVICE)
+            emb_attention_mask = batch["emb_attention_mask"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+            
+            logits, hidden = model(input_ids, emb, attention_mask=attention_mask, emb_attention_mask=None)
+            pred_idx = torch.argmax(logits, dim=1)
+            defer_label = (pred_idx != labels).long()
+            hidden_unsq = hidden.unsqueeze(1)
+            defer_logits = policy(emb, hidden_unsq, emb_attention_mask)
+            p_pred_idx = torch.argmax(defer_logits, dim=1)
+            
+            loss_cl = criterion(logits, labels)
+            loss_defer = criterion_p(defer_logits, defer_label)
+            loss = hyperparameters['alpha'] * loss_cl + hyperparameters['beta'] * loss_defer if epoch > hyperparameters['pre_step'] else loss_cl
+            val_loss += loss.item()
+            val_cl_loss += loss_cl.item()
+            val_policy_loss += loss_defer.item()
+            
+            val_y_true.extend(labels.cpu().numpy().tolist())
+            val_y_pred.extend(pred_idx.cpu().numpy().tolist())
+            val_p_true.extend(defer_label.cpu().numpy().tolist())
+            val_p_pred.extend(p_pred_idx.cpu().numpy().tolist())
+            deferred = torch.where(p_pred_idx == 1, labels, pred_idx)
+            val_y_defer.extend(deferred.cpu().numpy().tolist())
+            defer_count += (p_pred_idx == 1).sum().item()
+            
+        val_acc = accuracy_score(val_y_true, val_y_pred)
+        val_f1 = f1_score(val_y_true, val_y_pred, average='macro')
+        val_qwk = cohen_kappa_score(val_y_true, val_y_pred, weights='quadratic')
+        val_policy_acc = accuracy_score(val_p_true, val_p_pred)
+        val_policy_f1 = f1_score(val_p_true, val_p_pred, average='macro')
+        val_defer_acc = accuracy_score(val_y_true, val_y_defer)
+        val_defer_f1 = f1_score(val_y_true, val_y_defer, average='macro')
+        val_defer_rate = defer_count / len(val_y_defer) if len(val_y_defer) > 0 else 0
+        
+        print(f"Epoch {epoch+1}: Validation Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Deferral Rate: {val_defer_rate:.4f}")
+        print(f"Train QWK: {train_qwk:.4f}, Val QWK: {val_qwk:.4f}")
+        print(f"Train Loss: {train_loss:.4f} (Cl: {train_cl_loss:.4f}, Policy: {train_policy_loss:.4f})")
+        
+        # Save best model based on validation accuracy and F1
+        if (val_acc > best_acc) and (val_f1 > best_f1):
+            best_acc = val_acc
+            best_f1 = val_f1
+            os.makedirs("checkpoint", exist_ok=True)
+            best_ckp_path = f"checkpoint/checkpoint_{args.ckp_name}_at_epoch{epoch+1}.pth"
+            torch.save(model.state_dict(), best_ckp_path)
+            print(f"Best model updated and saved to {best_ckp_path}")
+        
         wandb.log({
             "epoch": epoch+1,
-            "phase": phase_desc,
             "train_loss": train_loss,
             "train_cl_loss": train_cl_loss,
             "train_policy_loss": train_policy_loss,
             "train_acc": train_acc,
             "train_f1": train_f1,
+            "train_policy_acc": train_policy_acc,
+            "train_policy_f1": train_policy_f1,
+            "val_loss": val_loss,
+            "val_cl_loss": val_cl_loss,
+            "val_policy_loss": val_policy_loss,
+            "val_acc": val_acc,
+            "val_f1": val_f1,
+            "val_policy_acc": val_policy_acc,
+            "val_policy_f1": val_policy_f1,
+            "val_defer_acc": val_defer_acc,
+            "val_defer_f1": val_defer_f1,
+            "val_defer_rate": val_defer_rate,
             "train_qwk": train_qwk,
-            "train_policy_acc": policy_acc,
-            "train_policy_f1": policy_f1,
-            "val_loss": val_metrics["loss"],
-            "val_acc": val_metrics["acc"],
-            "val_f1": val_metrics["f1"],
-            "val_qwk": val_metrics["qwk"],
-            "val_policy_acc": val_metrics["policy_acc"],
-            "val_policy_f1": val_metrics["policy_f1"]
+            "val_qwk": val_qwk
         })
-
-    # Training complete
-    print("\nTraining complete!")
-    print(f"Best model path: {best_path}, val_acc={best_acc:.4f}, val_f1={best_f1:.4f}")
-
-    # Final Test (using best checkpoint if available)
-    if best_path is not None:
-        model.load_state_dict(torch.load(best_path, map_location=device))
-    test_metrics = evaluate(model, policy, test_loader, device, criterion_cl, criterion_p)
-    print(f"[Test]  acc={test_metrics['acc']:.3f}, f1={test_metrics['f1']:.3f}, qwk={test_metrics['qwk']:.3f}")
-    print(f"        policy_acc={test_metrics['policy_acc']:.3f}, policy_f1={test_metrics['policy_f1']:.3f}")
-
+        
+    # Test Loop
+    model.eval()
+    policy.eval()
+    test_y_true, test_y_pred = [], []
+    test_p_true, test_p_pred = [], []
+    test_iterator = tqdm(test_loader, desc="Test Iteration")
+    for step, batch in enumerate(test_iterator):
+        input_ids = batch["input_ids"].to(DEVICE)
+        attention_mask = batch["attention_mask"].to(DEVICE)
+        emb = batch["embedding"].to(DEVICE)
+        emb_attention_mask = batch["emb_attention_mask"].to(DEVICE)
+        labels = batch["label"].to(DEVICE)
+        
+        logits, hidden = model(input_ids, emb, attention_mask=attention_mask, emb_attention_mask=None)
+        pred_idx = torch.argmax(logits, dim=1)
+        defer_label = (pred_idx != labels).long()
+        hidden_unsq = hidden.unsqueeze(1)
+        defer_logits = policy(emb, hidden_unsq, emb_attention_mask)
+        p_pred_idx = torch.argmax(defer_logits, dim=1)
+        
+        test_y_pred.extend(pred_idx.cpu().numpy().tolist())
+        test_y_true.extend(labels.cpu().numpy().tolist())
+        test_p_true.extend(defer_label.cpu().numpy().tolist())
+        test_p_pred.extend(p_pred_idx.cpu().numpy().tolist())
+        
+    test_acc = accuracy_score(test_y_true, test_y_pred)
+    test_qwk = cohen_kappa_score(test_y_true, test_y_pred, weights='quadratic')
+    test_f1 = f1_score(test_y_true, test_y_pred, average='macro')
+    test_policy_acc = accuracy_score(test_p_true, test_p_pred)
+    test_policy_f1 = f1_score(test_p_true, test_p_pred, average='macro')
+    print("Test Accuracy: {:.4f}".format(test_acc))
+    print("Test QWK: {:.4f}".format(test_qwk))
+    print("Test F1: {:.4f}".format(test_f1))
+    print("Test Policy Accuracy: {:.4f}".format(test_policy_acc))
+    print("Test Policy F1: {:.4f}".format(test_policy_f1))
+    
     wandb.log({
-        "final_test_acc": test_metrics["acc"],
-        "final_test_f1": test_metrics["f1"],
-        "final_test_qwk": test_metrics["qwk"],
-        "final_test_policy_acc": test_metrics["policy_acc"],
-        "final_test_policy_f1": test_metrics["policy_f1"]
+        "test_acc": test_acc,
+        "test_qwk": test_qwk,
+        "test_f1": test_f1,
+        "test_policy_acc": test_policy_acc,
+        "test_policy_f1": test_policy_f1
     })
     wandb.finish()
-
-
+    
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device: 'cpu' or 'cuda:0'")
-    parser.add_argument("--run_name", type=str, default="jtsp_mnli", help="Unique run name for checkpoint/logging")
-    parser.add_argument("--p_lr", type=float, default=1e-5, help="Policy learning rate")
-    parser.add_argument("--clf_lr", type=float, default=2e-5, help="Classifier learning rate")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for classifier loss")
-    parser.add_argument("--beta", type=float, default=0.5, help="Weight for policy loss")
-    parser.add_argument("--policy_hidden", type=int, default=256, help="Deferral classifier hidden dimension")
+    parser.add_argument('--ckp_name', type=str, default='mnli_joint_ckpt',
+                        help='Checkpoint name')
+    parser.add_argument('--device', type=str, default='cuda:0',
+                        help='Device (e.g., cuda:0 or cpu)')
     args = parser.parse_args()
-
     train(args)
-
-if __name__ == "__main__":
+    
+if __name__ == '__main__':
     main()
